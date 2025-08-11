@@ -14,8 +14,8 @@ def compute_image_sharpness_numba(img: np.ndarray) -> float:
     for x in range(1, w - 1, 2):
         for y in range(1, h - 1, 2):
             # 计算 Pave(x, y)
-            #pave = (img[y, x] + img[y, x + 1] + img[y, x - 1] + img[y + 1, x] + img[y - 1, x]) / 5
-            pave = img[y, x]
+            pave = (img[y, x] + img[y, x + 1] + img[y, x - 1] + img[y + 1, x] + img[y - 1, x]) / 5
+
 
             # 计算 G1st(x, y)
             g1st = (abs(img[y, x + 1] - pave) + abs(img[y + 1, x] - pave) + abs(img[y + 1, x + 1] - pave)) ** 2
@@ -29,6 +29,195 @@ def compute_image_sharpness_numba(img: np.ndarray) -> float:
 
     return F
 
+
+import numpy as np
+from numba import njit
+import cv2
+
+
+@njit
+def variance_of_laplacian(img: np.ndarray) -> float:
+    """
+    Variance of Laplacian - One of the most reliable focus measures.
+    Higher variance indicates sharper image.
+    """
+    h, w = img.shape
+    laplacian = np.zeros_like(img, dtype=np.float64)
+
+    # Apply Laplacian kernel
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            laplacian[y, x] = (
+                    img[y - 1, x] + img[y + 1, x] + img[y, x - 1] + img[y, x + 1]
+                    - 4 * img[y, x]
+            )
+
+    # Calculate variance
+    mean_val = np.mean(laplacian)
+    variance = np.mean((laplacian - mean_val) ** 2)
+
+    return variance
+
+
+@njit
+def tenenbaum_gradient(img: np.ndarray) -> float:
+    """
+    Tenenbaum gradient (Tenengrad) - Uses Sobel operators.
+    Sums the square of gradient magnitudes.
+    """
+    h, w = img.shape
+    gradient_sum = 0.0
+
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            # Sobel X
+            gx = (img[y - 1, x + 1] + 2 * img[y, x + 1] + img[y + 1, x + 1] -
+                  img[y - 1, x - 1] - 2 * img[y, x - 1] - img[y + 1, x - 1]) / 8.0
+
+            # Sobel Y
+            gy = (img[y + 1, x - 1] + 2 * img[y + 1, x] + img[y + 1, x + 1] -
+                  img[y - 1, x - 1] - 2 * img[y - 1, x] - img[y - 1, x + 1]) / 8.0
+
+            gradient_sum += gx * gx + gy * gy
+
+    return gradient_sum / (h * w)
+
+
+@njit
+def brenner_gradient(img: np.ndarray) -> float:
+    """
+    Brenner's focus measure - Simple but effective.
+    Uses squared differences between pixels separated by 2 positions.
+    """
+    h, w = img.shape
+    focus_measure = 0.0
+    count = 0
+
+    # Horizontal differences
+    for y in range(h):
+        for x in range(w - 2):
+            diff = float(img[y, x + 2]) - float(img[y, x])
+            focus_measure += diff * diff
+            count += 1
+
+    # Vertical differences
+    for y in range(h - 2):
+        for x in range(w):
+            diff = float(img[y + 2, x]) - float(img[y, x])
+            focus_measure += diff * diff
+            count += 1
+
+    return focus_measure / count if count > 0 else 0.0
+
+
+@njit
+def normalized_variance(img: np.ndarray) -> float:
+    """
+    Normalized variance - Simple but often effective for focus detection.
+    Less sensitive to illumination changes.
+    """
+    h, w = img.shape
+    mean_val = np.mean(img)
+
+    if mean_val == 0:
+        return 0.0
+
+    variance = 0.0
+    for y in range(h):
+        for x in range(w):
+            diff = img[y, x] - mean_val
+            variance += diff * diff
+
+    variance = variance / (h * w)
+    # Normalize by mean to reduce illumination dependency
+    return variance / mean_val
+
+
+@njit
+def energy_of_gradient(img: np.ndarray) -> float:
+    """
+    Energy of gradient - Squared gradient method.
+    Simple first-order derivative approach.
+    """
+    h, w = img.shape
+    energy = 0.0
+
+    for y in range(h - 1):
+        for x in range(w - 1):
+            dx = float(img[y, x + 1]) - float(img[y, x])
+            dy = float(img[y + 1, x]) - float(img[y, x])
+            energy += dx * dx + dy * dy
+
+    return energy / ((h - 1) * (w - 1))
+
+
+@njit
+def modified_laplacian(img: np.ndarray) -> float:
+    """
+    Modified Laplacian - Uses absolute values instead of squares.
+    More robust to noise than standard Laplacian.
+    """
+    h, w = img.shape
+    ml_sum = 0.0
+
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            ml = abs(2 * img[y, x] - img[y, x - 1] - img[y, x + 1]) + \
+                 abs(2 * img[y, x] - img[y - 1, x] - img[y + 1, x])
+            ml_sum += ml
+
+    return ml_sum / ((h - 2) * (w - 2))
+
+
+def frequency_domain_sharpness(img: np.ndarray) -> float:
+    """
+    Frequency domain analysis - High frequencies indicate sharpness.
+    Note: This cannot be JIT compiled with numba due to FFT.
+    """
+    # Apply FFT
+    f_transform = np.fft.fft2(img)
+    f_shift = np.fft.fftshift(f_transform)
+    magnitude_spectrum = np.abs(f_shift)
+
+    h, w = img.shape
+    center_y, center_x = h // 2, w // 2
+
+    # Calculate total energy
+    total_energy = np.sum(magnitude_spectrum)
+
+    # Calculate high-frequency energy (outer region)
+    # Create a mask for high frequencies
+    Y, X = np.ogrid[:h, :w]
+    dist_from_center = np.sqrt((X - center_x) ** 2 + (Y - center_y) ** 2)
+
+    # Consider frequencies beyond 30% of the radius as high frequency
+    radius_threshold = min(center_x, center_y) * 0.3
+    high_freq_mask = dist_from_center > radius_threshold
+
+    high_freq_energy = np.sum(magnitude_spectrum[high_freq_mask])
+
+    # Return ratio of high frequency to total energy
+    return high_freq_energy / total_energy if total_energy > 0 else 0.0
+
+
+@njit
+def diagonal_laplacian(img: np.ndarray) -> float:
+    """
+    Diagonal Laplacian - Includes diagonal neighbors.
+    More comprehensive edge detection.
+    """
+    h, w = img.shape
+    laplacian_sum = 0.0
+
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            # 8-connected Laplacian
+            lap = (img[y - 1, x - 1] + img[y - 1, x] + img[y - 1, x + 1] +
+                   img[y, x - 1] - 8 * img[y, x] + img[y, x + 1] +
+                   img[y + 1, x - 1] + img[y + 1, x] + img[y + 1, x + 1])
+            laplacian_sum += abs(lap)
+
+    return laplacian_sum / ((h - 2) * (w - 2))
 
 def preprocess_image(img: np.ndarray) -> np.ndarray:
     """
@@ -204,7 +393,7 @@ def robust_pupil_detection(img: np.ndarray, debug: bool = False) -> Tuple[Option
     print(f"瞳孔中心位置:（{x} , {y}）")
 
     # 扩展区域用于清晰度计算
-    expand_factor = 1.5
+    expand_factor = 1.8
     expanded_radius = int(radius * expand_factor)
 
     # 边界检查
@@ -371,7 +560,7 @@ if __name__ == "__main__":
 
     # 批量处理示例
 
-    image_paths = glob.glob("yjx2/*.png", recursive=True)
+    image_paths = glob.glob("yjx/*.png", recursive=True)
     # image_paths = glob.glob("CASIA-IrisV4(JPG)/CASIA-Iris-Twins/**/*.jpg", recursive=True)
     # image_paths = [f"{i}.bmp" for i in range(1, 21)]
     sharpness_values = batch_process_images(image_paths, debug=False)
