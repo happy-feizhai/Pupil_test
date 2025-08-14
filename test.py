@@ -4,6 +4,7 @@ from numba import njit
 import matplotlib.pyplot as plt
 from typing import Tuple, Optional, List
 import glob
+import cpbd
 
 
 def extract_lower_pupil_roi(img, detected_circle):
@@ -23,7 +24,7 @@ def extract_lower_pupil_roi(img, detected_circle):
     # 横向：瞳孔左右各扩展1.3倍半径
     # 纵向：从瞳孔中心开始，向下扩展1.5倍半径
     expand_factor_x = 1.3
-    expand_factor_y = 1.8
+    expand_factor_y = 1.15
 
     # 计算ROI边界
     x1 = max(0, int(x - radius * expand_factor_x))
@@ -67,8 +68,9 @@ def extract_lower_iris_roi(img, detected_circle):
     # 计算ROI边界
     x1 = max(0, int(x - radius * iris_width_factor))
     x2 = min(w, int(x + radius * iris_width_factor))
-    y1 = max(0, int(y + radius * 1.05))  # 从瞳孔边缘稍下方开始
-    y2 = min(h, int(y + radius * (1.05 + roi_height_factor)))
+    y1 = max(0, int(y + radius * 1.01))  # 从瞳孔边缘稍下方开始
+    # y2 = min(h, int(y + radius * (1.05 + roi_height_factor)))
+    y2 =  min(h, int(y + radius * 1.01 + 60))
 
     # 确保ROI有效
     if y2 <= y1 or x2 <= x1:
@@ -175,47 +177,6 @@ def compute_image_sharpness_numba(img: np.ndarray) -> float:
     return F
 
 
-@njit
-def compute_sharpness_laplacian(img: np.ndarray) -> float:
-    """Laplacian方差法 - 对失焦特别敏感"""
-    h, w = img.shape
-    laplacian_sum = 0.0
-    count = 0
-
-    for y in range(1, h - 1):
-        for x in range(1, w - 1):
-            # 计算Laplacian
-            laplacian = (img[y - 1, x] + img[y + 1, x] +
-                         img[y, x - 1] + img[y, x + 1] -
-                         4 * img[y, x])
-            laplacian_sum += laplacian * laplacian
-            count += 1
-
-    return laplacian_sum / count
-
-@njit
-def variance_of_laplacian(img: np.ndarray) -> float:
-    """
-    Variance of Laplacian - One of the most reliable focus measures.
-    Higher variance indicates sharper image.
-    """
-    h, w = img.shape
-    laplacian = np.zeros_like(img, dtype=np.float64)
-
-    # Apply Laplacian kernel
-    for y in range(1, h - 1):
-        for x in range(1, w - 1):
-            laplacian[y, x] = (
-                    img[y - 1, x] + img[y + 1, x] + img[y, x - 1] + img[y, x + 1]
-                    - 4 * img[y, x]
-            )
-
-    # Calculate variance
-    mean_val = np.mean(laplacian)
-    variance = np.mean((laplacian - mean_val) ** 2)
-
-    return variance
-
 
 @njit
 def tenenbaum_gradient(img: np.ndarray) -> float:
@@ -268,27 +229,6 @@ def brenner_gradient(img: np.ndarray) -> float:
     return focus_measure / count if count > 0 else 0.0
 
 
-@njit
-def normalized_variance(img: np.ndarray) -> float:
-    """
-    Normalized variance - Simple but often effective for focus detection.
-    Less sensitive to illumination changes.
-    """
-    h, w = img.shape
-    mean_val = np.mean(img)
-
-    if mean_val == 0:
-        return 0.0
-
-    variance = 0.0
-    for y in range(h):
-        for x in range(w):
-            diff = img[y, x] - mean_val
-            variance += diff * diff
-
-    variance = variance / (h * w)
-    # Normalize by mean to reduce illumination dependency
-    return variance / mean_val
 
 
 @njit
@@ -308,23 +248,6 @@ def energy_of_gradient(img: np.ndarray) -> float:
 
     return energy / ((h - 1) * (w - 1))
 
-
-@njit
-def modified_laplacian(img: np.ndarray) -> float:
-    """
-    Modified Laplacian - Uses absolute values instead of squares.
-    More robust to noise than standard Laplacian.
-    """
-    h, w = img.shape
-    ml_sum = 0.0
-
-    for y in range(1, h - 1):
-        for x in range(1, w - 1):
-            ml = abs(2 * img[y, x] - img[y, x - 1] - img[y, x + 1]) + \
-                 abs(2 * img[y, x] - img[y - 1, x] - img[y + 1, x])
-            ml_sum += ml
-
-    return ml_sum / ((h - 2) * (w - 2))
 
 
 def frequency_domain_sharpness(img: np.ndarray) -> float:
@@ -357,26 +280,45 @@ def frequency_domain_sharpness(img: np.ndarray) -> float:
     # Return ratio of high frequency to total energy
     return high_freq_energy / total_energy if total_energy > 0 else 0.0
 
+def mlv_sharpness(img: np.ndarray) -> float:
+    imgf = img.astype(np.float32)
+    p = np.pad(imgf, ((1,1),(1,1)), mode='edge')
+    neighs = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            neighs.append(np.abs(imgf - p[1+dy:1+dy+imgf.shape[0], 1+dx:1+dx+imgf.shape[1]]))
+    mlv = np.maximum.reduce(neighs)
+    weight = mlv ** 1.5
+    mean_mlv = np.mean(mlv)
+    wstd = np.sqrt(np.mean(weight * (mlv - mean_mlv) ** 2))
+    return float(wstd + 1e-12)
 
-@njit
-def diagonal_laplacian(img: np.ndarray) -> float:
-    """
-    Diagonal Laplacian - Includes diagonal neighbors.
-    More comprehensive edge detection.
-    """
-    h, w = img.shape
-    laplacian_sum = 0.0
+def dct_high_freq_ratio(img: np.ndarray, hf_radius_ratio: float = 0.3) -> float:
+    f = cv2.dct(img.astype(np.float32))
+    mag = np.abs(f)
+    h, w = mag.shape
+    uu = np.arange(h).reshape(h, 1) / float(h)
+    vv = np.arange(w).reshape(1, w) / float(w)
+    radius = np.sqrt(uu ** 2 + vv ** 2)
+    mask = radius > hf_radius_ratio
+    hf = mag[mask].sum()
+    total = mag.sum() + 1e-12
+    return float(hf / total)
 
-    for y in range(1, h - 1):
-        for x in range(1, w - 1):
-            # 8-connected Laplacian
-            lap = (img[y - 1, x - 1] + img[y - 1, x] + img[y - 1, x + 1] +
-                   img[y, x - 1] - 8 * img[y, x] + img[y, x + 1] +
-                   img[y + 1, x - 1] + img[y + 1, x] + img[y + 1, x + 1])
-            laplacian_sum += abs(lap)
-
-    return laplacian_sum / ((h - 2) * (w - 2))
-
+def multiscale_tenengrad(img: np.ndarray, scales=(1, 2, 4)) -> float:
+    total = 0.0
+    for s in scales:
+        if s == 1:
+            small = img
+        else:
+            small = cv2.resize(img, (img.shape[1] // s, img.shape[0] // s), interpolation=cv2.INTER_LINEAR)
+        gx = cv2.Sobel(small, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(small, cv2.CV_64F, 0, 1, ksize=3)
+        e = np.mean(gx * gx + gy * gy)
+        total += e
+    return float(total)
 
 @njit
 def compute_sharpness_with_mask_numba(img: np.ndarray, mask: np.ndarray) -> float:
@@ -788,6 +730,8 @@ def detect_pupil_contour(img: np.ndarray) -> Optional[Tuple[int, int, int]]:
 #     # cv2.circle(crop_display, (center_x_crop, center_y_crop), 2, (0, 0, 255), 3)
 #
 #     return crop_display, sharpness
+
+
 
 def robust_pupil_detection(img: np.ndarray, debug: bool = False) -> Tuple[Optional[np.ndarray], float]:
     """
